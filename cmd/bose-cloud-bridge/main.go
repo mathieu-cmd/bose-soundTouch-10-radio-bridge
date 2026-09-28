@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -440,6 +441,8 @@ func accountDevice(w http.ResponseWriter, r *http.Request) {
 		dev.MACAddress = dev.DeviceID
 	}
 
+	rememberDevice(accountID, dev.DeviceID, dev.Name)
+
 	now := time.Now().UTC().Format("2006-01-02T15:04:05.000+00:00")
 	var b strings.Builder
 	_ = xml.EscapeText(&b, []byte(dev.Name))
@@ -631,20 +634,98 @@ func writeBoseXML(w http.ResponseWriter, status int, body string) {
 }
 
 func sourceProvidersXML() string {
-	now := time.Now().UTC().Format(time.RFC3339)
-	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><sourceProviders><sourceprovider id="11"><createdOn>%s</createdOn><name>LOCAL_INTERNET_RADIO</name><updatedOn>%s</updatedOn></sourceprovider></sourceProviders>`, now, now)
+	type prov struct {
+		id   int
+		name string
+		ts   string
+	}
+	provs := []prov{
+		{1, "PANDORA", "2012-09-19T12:43:00.000+00:00"},
+		{2, "INTERNET_RADIO", "2012-09-19T12:43:00.000+00:00"},
+		{3, "OFF", "2012-10-22T16:03:00.000+00:00"},
+		{4, "LOCAL", "2012-10-22T16:04:00.000+00:00"},
+		{5, "AIRPLAY", "2012-10-22T16:04:00.000+00:00"},
+		{7, "STORED_MUSIC", "2012-10-22T16:04:00.000+00:00"},
+		{9, "AUX", "2012-10-22T16:04:00.000+00:00"},
+		{11, "LOCAL_INTERNET_RADIO", "2013-01-10T09:45:00.000+00:00"},
+		{14, "DEEZER", "2014-03-17T15:30:27.000+00:00"},
+		{15, "SPOTIFY", "2014-03-17T15:30:27.000+00:00"},
+		{25, "TUNEIN", "2016-04-08T17:27:21.000+00:00"},
+	}
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><sourceProviders>`)
+	for _, p := range provs {
+		fmt.Fprintf(&b, `<sourceprovider id="%d"><createdOn>%s</createdOn><name>%s</name><updatedOn>%s</updatedOn></sourceprovider>`, p.id, p.ts, p.name, p.ts)
+	}
+	b.WriteString(`</sourceProviders>`)
+	return b.String()
 }
 
 func providerSettingsXML(accountID string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><providerSettings><providerSetting><boseId>%s</boseId><keyName>ELIGIBLE_FOR_TRIAL</keyName><value>true</value><providerId>14</providerId></providerSetting></providerSettings>`, accountID)
 }
 
+// registeredDevices remembers the speakers that paired via
+// POST /streaming/account/{account}/device, so /full can list them.
+// Optional env DEVICE_ID / DEVICE_NAME seed one device across restarts.
+var (
+	registeredMu      sync.Mutex
+	registeredDevices = map[string]map[string]string{} // account -> deviceID -> name
+)
+
+func rememberDevice(accountID, deviceID, name string) {
+	if accountID == "" || deviceID == "" {
+		return
+	}
+	registeredMu.Lock()
+	defer registeredMu.Unlock()
+	if registeredDevices[accountID] == nil {
+		registeredDevices[accountID] = map[string]string{}
+	}
+	if name == "" {
+		name = registeredDevices[accountID][deviceID]
+	}
+	registeredDevices[accountID][deviceID] = name
+}
+
+func devicesXML(accountID string) string {
+	registeredMu.Lock()
+	devs := map[string]string{}
+	for id, name := range registeredDevices[accountID] {
+		devs[id] = name
+	}
+	registeredMu.Unlock()
+	if envID := strings.TrimSpace(os.Getenv("DEVICE_ID")); envID != "" {
+		if _, ok := devs[envID]; !ok {
+			devs[envID] = strings.TrimSpace(os.Getenv("DEVICE_NAME"))
+		}
+	}
+	if len(devs) == 0 {
+		return "<devices></devices>"
+	}
+	now := "2019-01-24T08:18:37.000+00:00"
+	var b strings.Builder
+	b.WriteString("<devices>")
+	for id, name := range devs {
+		var esc strings.Builder
+		_ = xml.EscapeText(&esc, []byte(name))
+		fmt.Fprintf(&b, `<device deviceid="%s"><createdOn>%s</createdOn><firmwareVersion></firmwareVersion><ipaddress></ipaddress><name>%s</name><updatedOn>%s</updatedOn></device>`, id, now, esc.String(), now)
+	}
+	b.WriteString("</devices>")
+	return b.String()
+}
+
+// localInternetRadioSourceXML mirrors the LOCAL_INTERNET_RADIO source that the
+// Bose cloud (and AfterTouch) hand out: id 10003, provider 11, token credential.
+func localInternetRadioSourceXML() string {
+	token := base64.StdEncoding.EncodeToString([]byte(`{"serial":"local-internet-radio"}`))
+	return fmt.Sprintf(`<source id="10003" type="Audio"><createdOn>2019-01-24T08:18:37.000+00:00</createdOn><credential type="token">%s</credential><name>LOCAL_INTERNET_RADIO</name><sourceproviderid>11</sourceproviderid><sourcename></sourcename><sourceSettings/><updatedOn>2019-02-03T18:35:45.000+00:00</updatedOn><username></username></source>`, token)
+}
+
 func accountFullXML(accountID string) string {
-	now := time.Now().UTC().Format(time.RFC3339)
-	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><account id="%s"><accountStatus>OK</accountStatus><devices></devices><mode>global</mode><preferredLanguage>en</preferredLanguage><providerSettings><providerSetting><boseId>%s</boseId><keyName>ELIGIBLE_FOR_TRIAL</keyName><value>true</value><providerId>14</providerId></providerSetting></providerSettings><sources><source id="11" type="Audio"><createdOn>%s</createdOn><credential type="token"></credential><name></name><sourceproviderid>11</sourceproviderid><sourcename>Custom Stations</sourcename><sourceSettings></sourceSettings><updatedOn>%s</updatedOn><username></username></source></sources></account>`, accountID, accountID, now, now)
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><account id="%s"><accountStatus>OK</accountStatus>%s<mode>global</mode><preferredLanguage>en</preferredLanguage><providerSettings><providerSetting><boseId>%s</boseId><keyName>ELIGIBLE_FOR_TRIAL</keyName><value>false</value><providerId>14</providerId></providerSetting><providerSetting><boseId>%s</boseId><keyName>STREAMING_QUALITY</keyName><value>2</value><providerId>15</providerId></providerSetting></providerSettings><sources>%s</sources></account>`, accountID, devicesXML(accountID), accountID, accountID, localInternetRadioSourceXML())
 }
 
 func accountSourcesXML() string {
-	now := time.Now().UTC().Format(time.RFC3339)
-	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><sources><source id="11" type="Audio"><createdOn>%s</createdOn><credential type="token"></credential><name></name><sourceproviderid>11</sourceproviderid><sourcename>Custom Stations</sourcename><sourceSettings></sourceSettings><updatedOn>%s</updatedOn><username></username></source></sources>`, now, now)
+	return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><sources>` + localInternetRadioSourceXML() + `</sources>`
 }
