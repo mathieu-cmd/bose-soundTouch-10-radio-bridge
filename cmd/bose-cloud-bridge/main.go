@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"log"
@@ -290,6 +291,10 @@ func buildMux() *http.ServeMux {
 
 func registerAccountHandlers(mux *http.ServeMux, prefix string) {
 	mux.HandleFunc(prefix+"/account/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/device") && (r.Method == http.MethodPost || r.Method == http.MethodPut) {
+			accountDevice(w, r)
+			return
+		}
 		if !(strings.HasSuffix(r.URL.Path, "/full") || strings.HasSuffix(r.URL.Path, "/provider_settings") || strings.HasSuffix(r.URL.Path, "/sources")) {
 			http.NotFound(w, r)
 			return
@@ -408,6 +413,47 @@ func accountFull(w http.ResponseWriter, r *http.Request) {
 	accountID := parseAccountID(r.URL.Path, "/full")
 
 	writeBoseXML(w, http.StatusOK, accountFullXML(accountID))
+}
+
+// accountDevice answers the speaker's device registration (POST) or rename (PUT)
+// on /streaming/account/{account}/device[/{device}]. The speaker sends this
+// during /setMargeAccount pairing and refuses to pair without a valid answer.
+func accountDevice(w http.ResponseWriter, r *http.Request) {
+	logDebugf("account_device method=%s path=%s", r.Method, r.URL.Path)
+	accountID := parseAccountID(r.URL.Path, "")
+
+	var dev struct {
+		DeviceID   string `xml:"deviceid,attr"`
+		Name       string `xml:"name"`
+		MACAddress string `xml:"macaddress"`
+	}
+	body, _ := io.ReadAll(r.Body)
+	_ = xml.Unmarshal(body, &dev)
+	if dev.DeviceID == "" {
+		// PUT .../device/{deviceID}
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) > 0 && parts[len(parts)-1] != "device" {
+			dev.DeviceID = parts[len(parts)-1]
+		}
+	}
+	if dev.MACAddress == "" {
+		dev.MACAddress = dev.DeviceID
+	}
+
+	now := time.Now().UTC().Format("2006-01-02T15:04:05.000+00:00")
+	var b strings.Builder
+	_ = xml.EscapeText(&b, []byte(dev.Name))
+	name := b.String()
+	res := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><device deviceid="%s"><createdOn>%s</createdOn><ipaddress></ipaddress><name>%s</name><updatedOn>%s</updatedOn></device>`, dev.DeviceID, now, name, now)
+
+	w.Header().Set("Content-Type", "application/vnd.bose.streaming-v1.2+xml")
+	status := http.StatusOK
+	if r.Method == http.MethodPost {
+		status = http.StatusCreated
+		w.Header().Set("Location", requestScheme(r)+"://"+r.Host+"/streaming/account/"+accountID+"/device/"+dev.DeviceID)
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(res))
 }
 
 func accountProviderSettings(w http.ResponseWriter, r *http.Request) {
